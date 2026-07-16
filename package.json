@@ -1,0 +1,17 @@
+{
+  "name": "reliccraft-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for RelicCraft verification and moderation.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}
