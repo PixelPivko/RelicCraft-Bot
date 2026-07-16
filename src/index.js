@@ -16,6 +16,7 @@ const {
 } = require("discord.js");
 
 const fs = require("node:fs");
+const dns = require("node:dns").promises;
 const net = require("node:net");
 const path = require("node:path");
 
@@ -31,7 +32,7 @@ const CONFIG = {
   verifyChannelId: process.env.VERIFY_CHANNEL_ID,
   appealUrl: process.env.APPEAL_URL || "https://discord.gg/CYJ4bfTYMN",
   minecraftHost: process.env.MC_SERVER_HOST,
-  minecraftPort: Number(process.env.MC_SERVER_PORT || 25565),
+  minecraftPort: process.env.MC_SERVER_PORT ? Number(process.env.MC_SERVER_PORT) : null,
   minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
   minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 30_000),
 };
@@ -133,14 +134,42 @@ function parseMinecraftResponse(buffer) {
   return JSON.parse(buffer.subarray(offset, offset + jsonLength.value).toString("utf8"));
 }
 
-function pingMinecraftServer() {
+async function resolveMinecraftTarget() {
+  if (!CONFIG.minecraftHost) return null;
+
+  try {
+    const records = await dns.resolveSrv(`_minecraft._tcp.${CONFIG.minecraftHost}`);
+    if (records.length > 0) {
+      const record = records.sort((a, b) => a.priority - b.priority || b.weight - a.weight)[0];
+      return {
+        connectHost: record.name,
+        connectPort: record.port,
+        displayHost: CONFIG.minecraftHost,
+        displayPort: record.port,
+      };
+    }
+  } catch {
+    // No SRV record, use direct host and configured/default port.
+  }
+
+  return {
+    connectHost: CONFIG.minecraftHost,
+    connectPort: CONFIG.minecraftPort || 25565,
+    displayHost: CONFIG.minecraftHost,
+    displayPort: CONFIG.minecraftPort || 25565,
+  };
+}
+
+async function pingMinecraftServer() {
+  const target = await resolveMinecraftTarget();
+
   return new Promise((resolve) => {
-    if (!CONFIG.minecraftHost) {
+    if (!target) {
       resolve(null);
       return;
     }
 
-    const socket = net.createConnection({ host: CONFIG.minecraftHost, port: CONFIG.minecraftPort });
+    const socket = net.createConnection({ host: target.connectHost, port: target.connectPort });
     const chunks = [];
     let settled = false;
 
@@ -164,6 +193,7 @@ function pingMinecraftServer() {
           maxPlayers: response.players?.max || 0,
           players: response.players?.sample?.map((player) => player.name) || [],
           version: response.version?.name || "unknown",
+          displayAddress: `${target.displayHost}:${target.displayPort}`,
         });
       } catch {
         // Wait for the rest of the packet.
@@ -174,8 +204,8 @@ function pingMinecraftServer() {
       const handshake = createMinecraftPacket(
         writeVarInt(0),
         writeVarInt(767),
-        writeString(CONFIG.minecraftHost),
-        Buffer.from([(CONFIG.minecraftPort >> 8) & 0xff, CONFIG.minecraftPort & 0xff]),
+        writeString(target.displayHost),
+        Buffer.from([(target.connectPort >> 8) & 0xff, target.connectPort & 0xff]),
         writeVarInt(1),
       );
       const request = createMinecraftPacket(writeVarInt(0));
@@ -195,12 +225,14 @@ function saveStatusMessageId(messageId) {
 }
 
 function createMinecraftStatusEmbed(status) {
+  const fallbackAddress = `${CONFIG.minecraftHost}:${CONFIG.minecraftPort || 25565}`;
+
   if (!status || !status.online) {
     return new EmbedBuilder()
       .setColor(0xed4245)
       .setTitle("RelicCraft | Онлайн сервера")
       .setDescription("Сервер сейчас недоступен или не отвечает на ping.")
-      .addFields({ name: "Адрес", value: `${CONFIG.minecraftHost}:${CONFIG.minecraftPort}` })
+      .addFields({ name: "Адрес", value: fallbackAddress })
       .setTimestamp();
   }
 
@@ -213,7 +245,7 @@ function createMinecraftStatusEmbed(status) {
     .setTitle("RelicCraft | Онлайн сервера")
     .setDescription(`Сейчас на сервере **${status.onlinePlayers}/${status.maxPlayers}** игроков.`)
     .addFields(
-      { name: "Адрес", value: `${CONFIG.minecraftHost}:${CONFIG.minecraftPort}`, inline: true },
+      { name: "Адрес", value: status.displayAddress || fallbackAddress, inline: true },
       { name: "Версия", value: status.version, inline: true },
       { name: "Кто играет", value: playerList.slice(0, 1024) },
     )
