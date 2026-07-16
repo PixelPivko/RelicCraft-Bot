@@ -34,12 +34,42 @@ const CONFIG = {
   minecraftHost: process.env.MC_SERVER_HOST,
   minecraftPort: process.env.MC_SERVER_PORT ? Number(process.env.MC_SERVER_PORT) : null,
   minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
-  minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 30_000),
+  minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 35_000),
 };
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const PUNISHMENTS_FILE = path.join(DATA_DIR, "punishments.json");
 const STATUS_MESSAGE_FILE = path.join(DATA_DIR, "minecraft-status-message.json");
+const EMPTY_PLAYER_MESSAGES = [
+  "Здесь пусто... Грустно...",
+  "Мысли в голове",
+  "Я схожу с ума",
+  "Голова в мыслях",
+  "мЫслан",
+  "абоба",
+  "дух сталина",
+  "Herobrine",
+  "Крипер ушел за хлебом",
+  "Стив задумался о смысле алмазов",
+  "Тут был блок, но он ушел",
+  "Эхо шахты отвечает тишиной",
+  "Одинокий верстак ждет мастера",
+  "Печь остыла, уголь грустит",
+  "Зомби опоздал на смену",
+  "Деревня спит, жители в афке",
+  "Алмазы спрятались глубже обычного",
+  "Редстоун молчит подозрительно громко",
+  "Кто-то поставил факел и исчез",
+  "Пустота смотрит в чат",
+  "Скелет репетирует соло",
+  "Лава булькает без свидетелей",
+  "Трава растет, онлайн ждет",
+  "Кубическая тишина",
+  "На спавне перекати-блок",
+  "Инвентарь пуст, душа тоже",
+  "Пинг есть, людей нет",
+  "RelicCraft ждет героя",
+];
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
@@ -236,9 +266,10 @@ function createMinecraftStatusEmbed(status) {
       .setTimestamp();
   }
 
+  const emptyPlayerMessage = EMPTY_PLAYER_MESSAGES[Math.floor(Math.random() * EMPTY_PLAYER_MESSAGES.length)];
   const playerList = status.players.length > 0
     ? status.players.map((name) => `• ${name}`).join("\n")
-    : "Сервер не отдал список никнеймов. Онлайн виден, но имена скрыты.";
+    : emptyPlayerMessage;
 
   return new EmbedBuilder()
     .setColor(0x57f287)
