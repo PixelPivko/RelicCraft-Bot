@@ -23,7 +23,7 @@ const CONFIG = {
   guildId: process.env.GUILD_ID,
   moderatorRoleId: process.env.MODERATOR_ROLE_ID || "1524825124019241011",
   verifiedRoleId: process.env.VERIFIED_ROLE_ID,
-  unverifiedRoleId: process.env.UNVERIFIED_ROLE_ID,
+  unverifiedRoleId: process.env.UNVERIFIED_ROLE_ID || "1527318533325717584",
   muteRoleId: process.env.MUTE_ROLE_ID,
   blacklistRoleId: process.env.BLACKLIST_ROLE_ID,
   verifyChannelId: process.env.VERIFY_CHANNEL_ID,
@@ -128,7 +128,7 @@ function verificationButtonRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("relic_verify")
-      .setLabel("Верифицироваться")
+      .setLabel("Пройти верификацию")
       .setStyle(ButtonStyle.Success),
   );
 }
@@ -236,9 +236,30 @@ async function handleVerifyPanel(interaction) {
   }
 
   const embed = new EmbedBuilder()
-    .setColor(0x2ecc71)
+    .setColor(0x57f287)
     .setTitle("RelicCraft | Верификация")
-    .setDescription("Нажми кнопку ниже, чтобы получить доступ к серверу.");
+    .setDescription(
+      [
+        "Добро пожаловать на сервер RelicCraft.",
+        "",
+        "Чтобы получить доступ к основным каналам, нажми кнопку ниже. После проверки бот выдаст тебе роль участника и снимет роль не верифицированного.",
+      ].join("\n"),
+    )
+    .addFields(
+      {
+        name: "Зачем это нужно?",
+        value: "Верификация помогает защитить сервер от спама, ботов и случайных нарушителей.",
+      },
+      {
+        name: "Что будет после нажатия?",
+        value: "Ты получишь доступ к каналам сервера и сможешь спокойно общаться с участниками.",
+      },
+      {
+        name: "Если что-то не сработало",
+        value: "Напиши администрации сервера, и тебе помогут вручную.",
+      },
+    )
+    .setFooter({ text: "Relic-Bot • защита и порядок на RelicCraft" });
 
   await interaction.reply({ embeds: [embed], components: [verificationButtonRow()] });
 }
@@ -377,6 +398,11 @@ client.once(Events.ClientReady, async () => {
   console.log(`Relic-Bot is online as ${client.user.tag}`);
   await sweepExpiredPunishments();
   setInterval(() => sweepExpiredPunishments().catch(console.error), 60_000);
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (!CONFIG.unverifiedRoleId) return;
+  await member.roles.add(CONFIG.unverifiedRoleId, "New member joined RelicCraft").catch(console.error);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
