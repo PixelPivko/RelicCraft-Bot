@@ -23,6 +23,7 @@ const CONFIG = {
   guildId: process.env.GUILD_ID,
   moderatorRoleId: process.env.MODERATOR_ROLE_ID || "1524825124019241011",
   verifiedRoleId: process.env.VERIFIED_ROLE_ID,
+  unverifiedRoleId: process.env.UNVERIFIED_ROLE_ID,
   muteRoleId: process.env.MUTE_ROLE_ID,
   blacklistRoleId: process.env.BLACKLIST_ROLE_ID,
   verifyChannelId: process.env.VERIFY_CHANNEL_ID,
@@ -345,6 +346,9 @@ async function handleUnblacklist(interaction) {
 
 async function handleVerifyButton(interaction) {
   await interaction.member.roles.add(CONFIG.verifiedRoleId, "RelicCraft verification");
+  if (CONFIG.unverifiedRoleId) {
+    await interaction.member.roles.remove(CONFIG.unverifiedRoleId, "RelicCraft verification").catch(() => null);
+  }
   await interaction.reply({ content: "Готово! Ты прошел верификацию.", ephemeral: true });
 }
 
