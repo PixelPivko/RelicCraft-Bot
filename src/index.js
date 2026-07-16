@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const {
   ActionRowBuilder,
+  ActivityType,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -15,6 +16,7 @@ const {
 } = require("discord.js");
 
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 
 const CONFIG = {
@@ -28,10 +30,15 @@ const CONFIG = {
   blacklistRoleId: process.env.BLACKLIST_ROLE_ID,
   verifyChannelId: process.env.VERIFY_CHANNEL_ID,
   appealUrl: process.env.APPEAL_URL || "https://discord.gg/CYJ4bfTYMN",
+  minecraftHost: process.env.MC_SERVER_HOST,
+  minecraftPort: Number(process.env.MC_SERVER_PORT || 25565),
+  minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
+  minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 30_000),
 };
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const PUNISHMENTS_FILE = path.join(DATA_DIR, "punishments.json");
+const STATUS_MESSAGE_FILE = path.join(DATA_DIR, "minecraft-status-message.json");
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
@@ -76,6 +83,170 @@ function removePunishment(guildId, userId, type) {
     (item) => !(item.guildId === guildId && item.userId === userId && item.type === type),
   );
   savePunishments(punishments);
+}
+
+function writeVarInt(value) {
+  const bytes = [];
+  let number = value;
+  do {
+    let temp = number & 0x7f;
+    number >>>= 7;
+    if (number !== 0) temp |= 0x80;
+    bytes.push(temp);
+  } while (number !== 0);
+  return Buffer.from(bytes);
+}
+
+function readVarInt(buffer, offset = 0) {
+  let value = 0;
+  let position = 0;
+  let currentByte;
+
+  do {
+    currentByte = buffer[offset + position];
+    value |= (currentByte & 0x7f) << (7 * position);
+    position += 1;
+    if (position > 5) throw new Error("VarInt is too big");
+  } while ((currentByte & 0x80) === 0x80);
+
+  return { value, size: position };
+}
+
+function writeString(value) {
+  const text = Buffer.from(value, "utf8");
+  return Buffer.concat([writeVarInt(text.length), text]);
+}
+
+function createMinecraftPacket(...parts) {
+  const body = Buffer.concat(parts);
+  return Buffer.concat([writeVarInt(body.length), body]);
+}
+
+function parseMinecraftResponse(buffer) {
+  let offset = 0;
+  const packetLength = readVarInt(buffer, offset);
+  offset += packetLength.size;
+  const packetId = readVarInt(buffer, offset);
+  offset += packetId.size;
+  const jsonLength = readVarInt(buffer, offset);
+  offset += jsonLength.size;
+  return JSON.parse(buffer.subarray(offset, offset + jsonLength.value).toString("utf8"));
+}
+
+function pingMinecraftServer() {
+  return new Promise((resolve) => {
+    if (!CONFIG.minecraftHost) {
+      resolve(null);
+      return;
+    }
+
+    const socket = net.createConnection({ host: CONFIG.minecraftHost, port: CONFIG.minecraftPort });
+    const chunks = [];
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+
+    socket.setTimeout(5_000);
+    socket.on("timeout", () => finish({ online: false }));
+    socket.on("error", () => finish({ online: false }));
+    socket.on("data", (chunk) => {
+      chunks.push(chunk);
+      try {
+        const response = parseMinecraftResponse(Buffer.concat(chunks));
+        finish({
+          online: true,
+          onlinePlayers: response.players?.online || 0,
+          maxPlayers: response.players?.max || 0,
+          players: response.players?.sample?.map((player) => player.name) || [],
+          version: response.version?.name || "unknown",
+        });
+      } catch {
+        // Wait for the rest of the packet.
+      }
+    });
+
+    socket.on("connect", () => {
+      const handshake = createMinecraftPacket(
+        writeVarInt(0),
+        writeVarInt(767),
+        writeString(CONFIG.minecraftHost),
+        Buffer.from([(CONFIG.minecraftPort >> 8) & 0xff, CONFIG.minecraftPort & 0xff]),
+        writeVarInt(1),
+      );
+      const request = createMinecraftPacket(writeVarInt(0));
+      socket.write(Buffer.concat([handshake, request]));
+    });
+  });
+}
+
+function loadStatusMessageId() {
+  if (!fs.existsSync(STATUS_MESSAGE_FILE)) return null;
+  return JSON.parse(fs.readFileSync(STATUS_MESSAGE_FILE, "utf8")).messageId;
+}
+
+function saveStatusMessageId(messageId) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(STATUS_MESSAGE_FILE, JSON.stringify({ messageId }, null, 2));
+}
+
+function createMinecraftStatusEmbed(status) {
+  if (!status || !status.online) {
+    return new EmbedBuilder()
+      .setColor(0xed4245)
+      .setTitle("RelicCraft | Онлайн сервера")
+      .setDescription("Сервер сейчас недоступен или не отвечает на ping.")
+      .addFields({ name: "Адрес", value: `${CONFIG.minecraftHost}:${CONFIG.minecraftPort}` })
+      .setTimestamp();
+  }
+
+  const playerList = status.players.length > 0
+    ? status.players.map((name) => `• ${name}`).join("\n")
+    : "Сервер не отдал список никнеймов. Онлайн виден, но имена скрыты.";
+
+  return new EmbedBuilder()
+    .setColor(0x57f287)
+    .setTitle("RelicCraft | Онлайн сервера")
+    .setDescription(`Сейчас на сервере **${status.onlinePlayers}/${status.maxPlayers}** игроков.`)
+    .addFields(
+      { name: "Адрес", value: `${CONFIG.minecraftHost}:${CONFIG.minecraftPort}`, inline: true },
+      { name: "Версия", value: status.version, inline: true },
+      { name: "Кто играет", value: playerList.slice(0, 1024) },
+    )
+    .setFooter({ text: "Сообщение обновляется автоматически" })
+    .setTimestamp();
+}
+
+async function updateMinecraftStatus() {
+  if (!CONFIG.minecraftHost) return;
+
+  const status = await pingMinecraftServer();
+  if (status?.online) {
+    client.user.setActivity(`RelicCraft: ${status.onlinePlayers}/${status.maxPlayers} онлайн`, { type: ActivityType.Watching });
+  } else {
+    client.user.setActivity("RelicCraft: сервер оффлайн", { type: ActivityType.Watching });
+  }
+
+  if (!CONFIG.minecraftStatusChannelId) return;
+
+  const channel = await client.channels.fetch(CONFIG.minecraftStatusChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const embed = createMinecraftStatusEmbed(status);
+  const messageId = loadStatusMessageId();
+  const oldMessage = messageId ? await channel.messages.fetch(messageId).catch(() => null) : null;
+
+  if (oldMessage) {
+    await oldMessage.edit({ embeds: [embed] });
+    return;
+  }
+
+  const message = await channel.send({ embeds: [embed] });
+  saveStatusMessageId(message.id);
 }
 
 function parseDuration(input, allowPermanent = false) {
@@ -397,7 +568,9 @@ async function sweepExpiredPunishments() {
 client.once(Events.ClientReady, async () => {
   console.log(`Relic-Bot is online as ${client.user.tag}`);
   await sweepExpiredPunishments();
+  await updateMinecraftStatus();
   setInterval(() => sweepExpiredPunishments().catch(console.error), 60_000);
+  setInterval(() => updateMinecraftStatus().catch(console.error), CONFIG.minecraftStatusIntervalMs);
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
