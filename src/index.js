@@ -44,11 +44,13 @@ const CONFIG = {
       name: process.env.MC_SERVER_1_NAME || "Relic-Server #1",
       host: process.env.MC_SERVER_1_HOST || process.env.MC_SERVER_HOST || "play.reliccraft.online",
       port: readPort(process.env.MC_SERVER_1_PORT || process.env.MC_SERVER_PORT, 31688),
+      maxPlayers: Number(process.env.MC_SERVER_1_MAX_PLAYERS || 20),
     },
     {
       name: process.env.MC_SERVER_2_NAME || "Relic-Server #2",
       host: process.env.MC_SERVER_2_HOST || "reliccraftsafe.minerent.io",
       port: readPort(process.env.MC_SERVER_2_PORT, 25565),
+      maxPlayers: Number(process.env.MC_SERVER_2_MAX_PLAYERS || 20),
     },
   ].filter((server) => server.host),
   minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
@@ -506,54 +508,94 @@ async function pingMinecraftServer(server = null) {
   });
 }
 
-function loadStatusMessageId() {
-  if (!fs.existsSync(STATUS_MESSAGE_FILE)) return null;
-  return JSON.parse(fs.readFileSync(STATUS_MESSAGE_FILE, "utf8")).messageId;
+function loadStatusMessageIds() {
+  if (!fs.existsSync(STATUS_MESSAGE_FILE)) return {};
+  try {
+    const data = JSON.parse(fs.readFileSync(STATUS_MESSAGE_FILE, "utf8"));
+    if (data.messages && typeof data.messages === "object") return data.messages;
+    if (data.messageId) return { legacy: data.messageId };
+    return {};
+  } catch {
+    return {};
+  }
 }
 
-function saveStatusMessageId(messageId) {
+function saveStatusMessageIds(messages) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STATUS_MESSAGE_FILE, JSON.stringify({ messageId }, null, 2));
+  fs.writeFileSync(STATUS_MESSAGE_FILE, JSON.stringify({ messages }, null, 2));
 }
 
-function createMinecraftStatusEmbed(status) {
-  if (status?.servers) {
-    const onlineServers = status.servers.filter((server) => server.online);
-    const color = onlineServers.length > 0 ? 0x57f287 : 0xed4245;
-    const serverLines = status.servers.map((server) => {
-      if (!server.online) {
-        const fallbackAddress = `${server.config.host}:${server.config.port || 25565}`;
-        return `**${server.config.name}**\nОффлайн или не отвечает на ping.\nАдрес: \`${server.displayAddress || fallbackAddress}\``;
-      }
+function getServerStatusColor(status) {
+  if (!status?.online) return 0xed4245;
+  return 0x57f287;
+}
 
-      const playersText = server.players.length > 0
-        ? server.players.map((name) => `• ${name}`).join("\n")
-        : EMPTY_PLAYER_MESSAGES[Math.floor(Math.random() * EMPTY_PLAYER_MESSAGES.length)];
+function createMinecraftSummaryEmbed(summary) {
+  const onlineCount = summary.servers.filter((server) => server.online).length;
+  const totalCount = summary.servers.length;
+  let color = 0xed4245;
+  let state = "Все умерло";
+  let details = "Все серверы сейчас недоступны или не отвечают на ping.";
 
-      return [
-        `**${server.config.name}**`,
-        `Онлайн: **${server.onlinePlayers}/${server.maxPlayers}**`,
-        `Адрес: \`${server.displayAddress}\``,
-        `Версия: ${server.version}`,
-        `Кто играет:\n${playersText}`,
-      ].join("\n");
-    });
+  if (onlineCount === totalCount) {
+    color = 0x57f287;
+    state = "Все работают";
+    details = "Оба сервера отвечают и доступны для игроков.";
+  } else if (onlineCount > 0) {
+    color = 0xfee75c;
+    state = "Один активен / происходят тех. проблемы";
+    details = "Часть серверов отвечает, часть сейчас недоступна.";
+  }
 
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle("RelicCraft | Общий статус серверов")
+    .setDescription(`**${state}**\n${details}`)
+    .addFields(
+      { name: "Онлайн всех серверов", value: `Сервера- **${summary.totalOnline}/${summary.totalMax}** Онлайн` },
+      { name: "Проверено серверов", value: `${onlineCount}/${totalCount} работают`, inline: true },
+    )
+    .setFooter({ text: "Сообщение обновляется автоматически" })
+    .setTimestamp();
+}
+
+function createMinecraftServerEmbed(status, index) {
+  const config = status.config || CONFIG.minecraftServers[index] || {};
+  const fallbackAddress = `${config.host || CONFIG.minecraftHost}:${config.port || CONFIG.minecraftPort || 25565}`;
+
+  if (!status?.online) {
     return new EmbedBuilder()
-      .setColor(color)
-      .setTitle("RelicCraft | Онлайн серверов")
-      .setDescription(`Сейчас на серверах **${status.totalOnline}/${status.totalMax}** игроков.`)
+      .setColor(0xed4245)
+      .setTitle(`RelicCraft | ${config.name || `Сервер #${index + 1}`}`)
+      .setDescription("Сервер сейчас недоступен или не отвечает на ping.")
       .addFields(
-        { name: "Общий онлайн", value: `Сервера- **${status.totalOnline}/${status.totalMax}** Онлайн` },
-        ...serverLines.map((line, index) => ({
-          name: CONFIG.minecraftServers[index]?.name || `Сервер #${index + 1}`,
-          value: line.slice(0, 1024),
-        })),
+        { name: "Статус", value: "Оффлайн", inline: true },
+        { name: "Адрес", value: status?.displayAddress || fallbackAddress, inline: true },
       )
       .setFooter({ text: "Сообщение обновляется автоматически" })
       .setTimestamp();
   }
 
+  const emptyPlayerMessage = EMPTY_PLAYER_MESSAGES[Math.floor(Math.random() * EMPTY_PLAYER_MESSAGES.length)];
+  const playerList = status.players.length > 0
+    ? status.players.map((name) => `• ${name}`).join("\n")
+    : emptyPlayerMessage;
+
+  return new EmbedBuilder()
+    .setColor(getServerStatusColor(status))
+    .setTitle(`RelicCraft | ${config.name || `Сервер #${index + 1}`}`)
+    .setDescription(`Сейчас на сервере **${status.onlinePlayers}/${status.maxPlayers}** игроков.`)
+    .addFields(
+      { name: "Статус", value: "Онлайн", inline: true },
+      { name: "Адрес", value: status.displayAddress || fallbackAddress, inline: true },
+      { name: "Версия", value: status.version, inline: true },
+      { name: "Кто играет", value: playerList.slice(0, 1024) },
+    )
+    .setFooter({ text: "Сообщение обновляется автоматически" })
+    .setTimestamp();
+}
+
+function createMinecraftStatusEmbed(status) {
   const fallbackAddress = `${CONFIG.minecraftHost}:${CONFIG.minecraftPort || 25565}`;
 
   if (!status || !status.online) {
@@ -583,6 +625,18 @@ function createMinecraftStatusEmbed(status) {
     .setTimestamp();
 }
 
+async function upsertStatusMessage(channel, key, embed, messages) {
+  const oldMessage = messages[key] ? await channel.messages.fetch(messages[key]).catch(() => null) : null;
+
+  if (oldMessage) {
+    await oldMessage.edit({ embeds: [embed] });
+    return messages;
+  }
+
+  const message = await channel.send({ embeds: [embed] });
+  return { ...messages, [key]: message.id };
+}
+
 async function updateMinecraftStatus() {
   if (CONFIG.minecraftServers.length > 0) {
     const servers = await Promise.all(
@@ -596,7 +650,7 @@ async function updateMinecraftStatus() {
       }),
     );
     const totalOnline = servers.reduce((sum, server) => sum + (server?.online ? server.onlinePlayers || 0 : 0), 0);
-    const totalMax = servers.reduce((sum, server) => sum + (server?.online ? server.maxPlayers || 0 : 0), 0);
+    const totalMax = servers.reduce((sum, server) => sum + (server?.online ? server.maxPlayers || 0 : server.config.maxPlayers || 0), 0);
     const summary = { servers, totalOnline, totalMax };
 
     if (totalMax > 0) {
@@ -610,17 +664,17 @@ async function updateMinecraftStatus() {
     const channel = await client.channels.fetch(CONFIG.minecraftStatusChannelId).catch(() => null);
     if (!channel?.isTextBased()) return;
 
-    const embed = createMinecraftStatusEmbed(summary);
-    const messageId = loadStatusMessageId();
-    const oldMessage = messageId ? await channel.messages.fetch(messageId).catch(() => null) : null;
-
-    if (oldMessage) {
-      await oldMessage.edit({ embeds: [embed] });
-      return;
+    let messages = loadStatusMessageIds();
+    if (messages.legacy) {
+      const legacyMessage = await channel.messages.fetch(messages.legacy).catch(() => null);
+      await legacyMessage?.delete().catch(() => null);
+      delete messages.legacy;
     }
-
-    const message = await channel.send({ embeds: [embed] });
-    saveStatusMessageId(message.id);
+    messages = await upsertStatusMessage(channel, "summary", createMinecraftSummaryEmbed(summary), messages);
+    for (const [index, serverStatus] of servers.entries()) {
+      messages = await upsertStatusMessage(channel, `server${index + 1}`, createMinecraftServerEmbed(serverStatus, index), messages);
+    }
+    saveStatusMessageIds(messages);
     return;
   }
 
@@ -638,17 +692,9 @@ async function updateMinecraftStatus() {
   const channel = await client.channels.fetch(CONFIG.minecraftStatusChannelId).catch(() => null);
   if (!channel?.isTextBased()) return;
 
-  const embed = createMinecraftStatusEmbed(status);
-  const messageId = loadStatusMessageId();
-  const oldMessage = messageId ? await channel.messages.fetch(messageId).catch(() => null) : null;
-
-  if (oldMessage) {
-    await oldMessage.edit({ embeds: [embed] });
-    return;
-  }
-
-  const message = await channel.send({ embeds: [embed] });
-  saveStatusMessageId(message.id);
+  let messages = loadStatusMessageIds();
+  messages = await upsertStatusMessage(channel, "legacy", createMinecraftStatusEmbed(status), messages);
+  saveStatusMessageIds(messages);
 }
 
 function parseDuration(input, allowPermanent = false) {
