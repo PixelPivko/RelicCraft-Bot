@@ -35,11 +35,46 @@ const CONFIG = {
   minecraftPort: process.env.MC_SERVER_PORT ? Number(process.env.MC_SERVER_PORT) : null,
   minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
   minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 35_000),
+  antiSpamEnabled: process.env.ANTI_SPAM_ENABLED !== "false",
+  antiPhishingEnabled: process.env.ANTI_PHISHING_ENABLED !== "false",
+  antiSpamMaxMessages: Number(process.env.ANTI_SPAM_MAX_MESSAGES || 5),
+  antiSpamWindowMs: Number(process.env.ANTI_SPAM_WINDOW_MS || 7_000),
+  antiSpamTimeoutMs: Number(process.env.ANTI_SPAM_TIMEOUT_MS || 60_000),
+  xpMin: Number(process.env.XP_MIN || 15),
+  xpMax: Number(process.env.XP_MAX || 25),
+  xpCooldownMs: Number(process.env.XP_COOLDOWN_MS || 60_000),
+  blockedWords: (process.env.BLOCKED_WORDS || "")
+    .split(",")
+    .map((word) => word.trim().toLowerCase())
+    .filter(Boolean),
 };
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const PUNISHMENTS_FILE = path.join(DATA_DIR, "punishments.json");
 const STATUS_MESSAGE_FILE = path.join(DATA_DIR, "minecraft-status-message.json");
+const BLOCKED_WORDS_FILE = path.join(DATA_DIR, "blocked-words.json");
+const LEVELS_FILE = path.join(DATA_DIR, "levels.json");
+const WARNINGS_FILE = path.join(DATA_DIR, "warnings.json");
+const messageBuckets = new Map();
+const xpCooldowns = new Map();
+const PHISHING_PATTERNS = [
+  /discord(?:app)?\.(?:gift|gifts|nitro)/i,
+  /d[i1l]sc[o0]rd(?:app)?\.(?:gift|gifts|nitro|gg)/i,
+  /free\s*(?:nitro|steam|robux|crypto)/i,
+  /nitro\s*(?:free|gift|бесплатн)/i,
+  /steam(?:community|cornmunity|communnity)\.[a-z]+\/(?:gift|promo|trade)/i,
+  /(?:mr\s*beast|mrbeast|мистер\s*бист|мистер\s*биста).*(?:casino|казино|crypto|крипт|usdt|btc|bitcoin|биткоин)/i,
+  /(?:casino|казино|crypto|крипт|usdt|btc|bitcoin|биткоин).*(?:mr\s*beast|mrbeast|мистер\s*бист|мистер\s*биста)/i,
+];
+const SUSPICIOUS_DOMAINS = [
+  "discord-gift",
+  "discordgift",
+  "discordnitro",
+  "free-nitro",
+  "steamgift",
+  "mrbeast",
+  "crypto-casino",
+];
 const EMPTY_PLAYER_MESSAGES = [
   "Здесь пусто... Грустно...",
   "Мысли в голове",
@@ -72,7 +107,12 @@ const EMPTY_PLAYER_MESSAGES = [
 ];
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 function ensureConfig() {
@@ -114,6 +154,207 @@ function removePunishment(guildId, userId, type) {
     (item) => !(item.guildId === guildId && item.userId === userId && item.type === type),
   );
   savePunishments(punishments);
+}
+
+function loadJsonFile(filePath, fallback) {
+  if (!fs.existsSync(filePath)) return fallback;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJsonFile(filePath, data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function xpForLevel(level) {
+  return level * level * 100;
+}
+
+function levelFromXp(xp) {
+  return Math.floor(Math.sqrt(xp / 100));
+}
+
+function getRankRecord(userId) {
+  const levels = loadJsonFile(LEVELS_FILE, {});
+  return levels[userId] || { xp: 0, level: 0, messages: 0 };
+}
+
+function rankEmbed(user, record, rankPosition = null) {
+  const currentLevelXp = xpForLevel(record.level);
+  const nextLevelXp = xpForLevel(record.level + 1);
+  const progress = Math.max(0, record.xp - currentLevelXp);
+  const needed = Math.max(1, nextLevelXp - currentLevelXp);
+  const progressBarSize = 12;
+  const filled = Math.min(progressBarSize, Math.floor((progress / needed) * progressBarSize));
+  const bar = `${"█".repeat(filled)}${"░".repeat(progressBarSize - filled)}`;
+
+  return new EmbedBuilder()
+    .setColor(0x57f287)
+    .setTitle(`RelicCraft | Ранг ${user.username}`)
+    .setThumbnail(user.displayAvatarURL())
+    .addFields(
+      { name: "Уровень", value: String(record.level), inline: true },
+      { name: "XP", value: `${record.xp}/${nextLevelXp}`, inline: true },
+      { name: "Сообщений", value: String(record.messages || 0), inline: true },
+      { name: "Прогресс", value: `${bar} ${progress}/${needed}` },
+      { name: "Место", value: rankPosition ? `#${rankPosition}` : "Не рассчитано", inline: true },
+    )
+    .setFooter({ text: "Relic-Bot • уровни RelicCraft" });
+}
+
+function getRankPosition(userId) {
+  const levels = loadJsonFile(LEVELS_FILE, {});
+  const sorted = Object.entries(levels).sort(([, a], [, b]) => (b.xp || 0) - (a.xp || 0));
+  const index = sorted.findIndex(([id]) => id === userId);
+  return index >= 0 ? index + 1 : null;
+}
+
+async function handleXp(message) {
+  if (!message.guild || message.author.bot) return;
+
+  const now = Date.now();
+  const key = `${message.guildId}:${message.author.id}`;
+  if (xpCooldowns.has(key) && now - xpCooldowns.get(key) < CONFIG.xpCooldownMs) return;
+  xpCooldowns.set(key, now);
+
+  const levels = loadJsonFile(LEVELS_FILE, {});
+  const record = levels[message.author.id] || { xp: 0, level: 0, messages: 0 };
+  const oldLevel = record.level || 0;
+  const gained = Math.floor(Math.random() * (CONFIG.xpMax - CONFIG.xpMin + 1)) + CONFIG.xpMin;
+
+  record.xp = (record.xp || 0) + gained;
+  record.messages = (record.messages || 0) + 1;
+  record.level = levelFromXp(record.xp);
+  levels[message.author.id] = record;
+  saveJsonFile(LEVELS_FILE, levels);
+
+  if (record.level > oldLevel) {
+    const embed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle("RelicCraft | Новый уровень!")
+      .setDescription(`Поздравляю, ты повысил уровень до **${record.level}**.`)
+      .addFields({ name: "Текущий XP", value: String(record.xp), inline: true })
+      .setFooter({ text: "Relic-Bot • продолжай общаться на сервере" });
+    await message.author.send({ embeds: [embed] }).catch(() => null);
+  }
+}
+
+function loadWarnings() {
+  return loadJsonFile(WARNINGS_FILE, {});
+}
+
+function saveWarnings(warnings) {
+  saveJsonFile(WARNINGS_FILE, warnings);
+}
+
+function loadBlockedWords() {
+  let fileWords = [];
+  if (fs.existsSync(BLOCKED_WORDS_FILE)) {
+    try {
+      fileWords = JSON.parse(fs.readFileSync(BLOCKED_WORDS_FILE, "utf8"));
+    } catch {
+      fileWords = [];
+    }
+  }
+
+  return [...CONFIG.blockedWords, ...fileWords]
+    .map((word) => String(word).trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function normalizeMessageContent(content) {
+  return content
+    .toLowerCase()
+    .replace(/[\u200b-\u200f\u202a-\u202e]/g, "")
+    .replace(/[|`_*~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactMessageContent(content) {
+  return normalizeMessageContent(content)
+    .replace(/[4@]/g, "a")
+    .replace(/[3]/g, "e")
+    .replace(/[1!|]/g, "i")
+    .replace(/[0]/g, "o")
+    .replace(/[5$]/g, "s")
+    .replace(/[7]/g, "t")
+    .replace(/[^a-zа-яё0-9]/gi, "");
+}
+
+function hasBlockedWord(content) {
+  const normalized = normalizeMessageContent(content);
+  const compact = compactMessageContent(content);
+  return loadBlockedWords().some((word) => {
+    const normalizedWord = normalizeMessageContent(word);
+    const compactWord = compactMessageContent(word);
+    return normalized.includes(normalizedWord) || (compactWord.length >= 3 && compact.includes(compactWord));
+  });
+}
+
+function hasUrl(content) {
+  return /(https?:\/\/|www\.|discord\.gg\/|\.ru|\.com|\.net|\.online|\.site|\.xyz)/i.test(content);
+}
+
+function isPhishingOrScam(message) {
+  const content = normalizeMessageContent(message.content);
+  const hasAttachment = message.attachments.size > 0;
+  const containsSuspiciousDomain = SUSPICIOUS_DOMAINS.some((part) => content.includes(part));
+  const broScam = /\bbro\b/i.test(content) && (hasUrl(content) || hasAttachment);
+
+  return (
+    PHISHING_PATTERNS.some((pattern) => pattern.test(content)) ||
+    containsSuspiciousDomain ||
+    broScam
+  );
+}
+
+function isSpam(message) {
+  const now = Date.now();
+  const key = `${message.guildId}:${message.author.id}`;
+  const bucket = messageBuckets.get(key) || { timestamps: [], lastContent: "", repeats: 0 };
+  const normalized = normalizeMessageContent(message.content);
+
+  bucket.timestamps = bucket.timestamps.filter((timestamp) => now - timestamp <= CONFIG.antiSpamWindowMs);
+  bucket.timestamps.push(now);
+  bucket.repeats = normalized && normalized === bucket.lastContent ? bucket.repeats + 1 : 1;
+  bucket.lastContent = normalized;
+  messageBuckets.set(key, bucket);
+
+  return bucket.timestamps.length > CONFIG.antiSpamMaxMessages || bucket.repeats >= 3;
+}
+
+async function deleteMessage(message, reason) {
+  await message.delete().catch(() => null);
+
+  if (reason === "spam" && message.member?.moderatable) {
+    await message.member.timeout(CONFIG.antiSpamTimeoutMs, "Relic-Bot anti-spam").catch(() => null);
+  }
+}
+
+async function handleAutoModeration(message) {
+  if (!message.guild || message.author.bot) return false;
+
+  if (CONFIG.antiPhishingEnabled && isPhishingOrScam(message)) {
+    await deleteMessage(message, "phishing");
+    return true;
+  }
+
+  if (hasBlockedWord(message.content)) {
+    await deleteMessage(message, "blocked-word");
+    return true;
+  }
+
+  if (CONFIG.antiSpamEnabled && isSpam(message)) {
+    await deleteMessage(message, "spam");
+    return true;
+  }
+
+  return false;
 }
 
 function writeVarInt(value) {
@@ -455,6 +696,64 @@ function commands() {
       .setName("unblacklist")
       .setDescription("Снять ЧСП")
       .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("clear")
+      .setDescription("Очистить сообщения в канале, до 500")
+      .addIntegerOption((option) => option.setName("amount").setDescription("Количество от 1 до 500").setRequired(true).setMinValue(1).setMaxValue(500))
+      .addUserOption((option) => option.setName("user").setDescription("Удалять только сообщения участника").setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName("rank")
+      .setDescription("Показать уровень и рейтинг")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName("ранг")
+      .setDescription("Показать уровень и рейтинг")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName("warn")
+      .setDescription("Выдать предупреждение")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(true))
+      .addStringOption((option) => option.setName("reason").setDescription("Причина").setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName("warnings")
+      .setDescription("Показать предупреждения участника")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName("unwarn")
+      .setDescription("Удалить предупреждение по номеру")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(true))
+      .addIntegerOption((option) => option.setName("index").setDescription("Номер предупреждения").setRequired(true).setMinValue(1)),
+
+    new SlashCommandBuilder()
+      .setName("ban")
+      .setDescription("Забанить участника")
+      .addUserOption((option) => option.setName("user").setDescription("Участник").setRequired(true))
+      .addStringOption((option) => option.setName("reason").setDescription("Причина").setRequired(true))
+      .addIntegerOption((option) => option.setName("delete_days").setDescription("Удалить сообщения за N дней, 0-7").setRequired(false).setMinValue(0).setMaxValue(7)),
+
+    new SlashCommandBuilder()
+      .setName("unban")
+      .setDescription("Разбанить по ID")
+      .addStringOption((option) => option.setName("user_id").setDescription("ID пользователя").setRequired(true))
+      .addStringOption((option) => option.setName("reason").setDescription("Причина").setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName("lock")
+      .setDescription("Закрыть канал для @everyone"),
+
+    new SlashCommandBuilder()
+      .setName("unlock")
+      .setDescription("Открыть канал для @everyone"),
+
+    new SlashCommandBuilder()
+      .setName("slowmode")
+      .setDescription("Поставить медленный режим")
+      .addIntegerOption((option) => option.setName("seconds").setDescription("Секунды, 0 чтобы выключить").setRequired(true).setMinValue(0).setMaxValue(21600)),
   ].map((command) => command.toJSON());
 }
 
@@ -599,6 +898,162 @@ async function handleUnblacklist(interaction) {
   await interaction.reply(`ЧСП снят с ${member.user.tag}.`);
 }
 
+async function handleClear(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const amount = interaction.options.getInteger("amount", true);
+  const user = interaction.options.getUser("user");
+  const channel = interaction.channel;
+
+  if (!channel?.bulkDelete || !channel.messages?.fetch) {
+    await interaction.reply({ content: "В этом канале нельзя очищать сообщения.", ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  let deletedTotal = 0;
+  let lastId = null;
+
+  while (deletedTotal < amount) {
+    const fetchLimit = Math.min(100, amount - deletedTotal);
+    const fetched = await channel.messages.fetch({ limit: fetchLimit, before: lastId || undefined }).catch(() => null);
+    if (!fetched || fetched.size === 0) break;
+
+    lastId = fetched.last()?.id;
+    const filtered = user ? fetched.filter((message) => message.author.id === user.id) : fetched;
+    if (filtered.size > 0) {
+      const deleted = await channel.bulkDelete(filtered, true).catch(() => null);
+      deletedTotal += deleted?.size || 0;
+    }
+
+    if (fetched.size < fetchLimit) break;
+    if (user && filtered.size === 0) continue;
+  }
+
+  await interaction.editReply(`Очищено сообщений: ${deletedTotal}/${amount}.`);
+}
+
+async function handleRank(interaction) {
+  const user = interaction.options.getUser("user") || interaction.user;
+  const record = getRankRecord(user.id);
+  await interaction.reply({ embeds: [rankEmbed(user, record, getRankPosition(user.id))] });
+}
+
+async function handleWarn(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const member = await getTargetMember(interaction);
+  if (!member) return;
+
+  const reason = interaction.options.getString("reason", true);
+  const warnings = loadWarnings();
+  const userWarnings = warnings[member.id] || [];
+  userWarnings.push({
+    reason,
+    moderatorId: interaction.user.id,
+    createdAt: new Date().toISOString(),
+  });
+  warnings[member.id] = userWarnings;
+  saveWarnings(warnings);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xf1c40f)
+    .setTitle("RelicCraft | Предупреждение")
+    .setDescription(`Ты получил предупреждение от ${interaction.user}.`)
+    .addFields(
+      { name: "Причина", value: reason },
+      { name: "Всего предупреждений", value: String(userWarnings.length), inline: true },
+    );
+  await member.user.send({ embeds: [embed] }).catch(() => null);
+  await interaction.reply(`Предупреждение выдано ${member.user.tag}. Всего: ${userWarnings.length}.`);
+}
+
+async function handleWarnings(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const user = interaction.options.getUser("user", true);
+  const warnings = loadWarnings()[user.id] || [];
+
+  if (warnings.length === 0) {
+    await interaction.reply({ content: `У ${user.tag} нет предупреждений.`, ephemeral: true });
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0xf1c40f)
+    .setTitle(`Предупреждения ${user.tag}`)
+    .setDescription(
+      warnings
+        .map((warning, index) => `${index + 1}. ${warning.reason} — <@${warning.moderatorId}>`)
+        .join("\n")
+        .slice(0, 4000),
+    );
+  await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+async function handleUnwarn(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const user = interaction.options.getUser("user", true);
+  const index = interaction.options.getInteger("index", true) - 1;
+  const warnings = loadWarnings();
+  const userWarnings = warnings[user.id] || [];
+
+  if (!userWarnings[index]) {
+    await interaction.reply({ content: "Предупреждение с таким номером не найдено.", ephemeral: true });
+    return;
+  }
+
+  const removed = userWarnings.splice(index, 1)[0];
+  warnings[user.id] = userWarnings;
+  saveWarnings(warnings);
+  await interaction.reply(`Удалено предупреждение ${user.tag}: ${removed.reason}`);
+}
+
+async function handleBan(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const user = interaction.options.getUser("user", true);
+  const reason = interaction.options.getString("reason", true);
+  const deleteDays = interaction.options.getInteger("delete_days") || 0;
+
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  if (member) {
+    await sendPunishmentDm(user, {
+      actionName: "бан",
+      admin: interaction.user,
+      reason,
+      permanent: true,
+    });
+  }
+
+  await interaction.guild.members.ban(user.id, { reason, deleteMessageSeconds: deleteDays * 86400 });
+  await interaction.reply(`Пользователь ${user.tag} забанен. Причина: ${reason}`);
+}
+
+async function handleUnban(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const userId = interaction.options.getString("user_id", true);
+  const reason = interaction.options.getString("reason") || "Unban by moderator";
+  await interaction.guild.members.unban(userId, reason);
+  await interaction.reply(`Пользователь ${userId} разбанен.`);
+}
+
+async function handleLock(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false });
+  await interaction.reply("Канал закрыт для @everyone.");
+}
+
+async function handleUnlock(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: null });
+  await interaction.reply("Канал снова открыт для @everyone.");
+}
+
+async function handleSlowmode(interaction) {
+  if (!(await requireModerator(interaction))) return;
+  const seconds = interaction.options.getInteger("seconds", true);
+  await interaction.channel.setRateLimitPerUser(seconds, `Slowmode set by ${interaction.user.tag}`);
+  await interaction.reply(seconds === 0 ? "Медленный режим выключен." : `Медленный режим: ${seconds} сек.`);
+}
+
 async function handleVerifyButton(interaction) {
   await interaction.member.roles.add(CONFIG.verifiedRoleId, "RelicCraft verification");
   if (CONFIG.unverifiedRoleId) {
@@ -641,6 +1096,15 @@ client.on(Events.GuildMemberAdd, async (member) => {
   await member.roles.add(CONFIG.unverifiedRoleId, "New member joined RelicCraft").catch(console.error);
 });
 
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    const deleted = await handleAutoModeration(message);
+    if (!deleted) await handleXp(message);
+  } catch (error) {
+    console.error(error);
+  }
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton() && interaction.customId === "relic_verify") {
@@ -658,6 +1122,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       unmute: handleUnmute,
       blacklist: handleBlacklist,
       unblacklist: handleUnblacklist,
+      clear: handleClear,
+      rank: handleRank,
+      "ранг": handleRank,
+      warn: handleWarn,
+      warnings: handleWarnings,
+      unwarn: handleUnwarn,
+      ban: handleBan,
+      unban: handleUnban,
+      lock: handleLock,
+      unlock: handleUnlock,
+      slowmode: handleSlowmode,
     };
 
     const handler = handlers[interaction.commandName];
