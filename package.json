@@ -1,7 +1,7 @@
 {
-  "name": "reliccraft-discord-bot",
+  "name": "relic-bot-security",
   "version": "1.0.0",
-  "description": "Discord bot for RelicCraft verification and moderation.",
+  "description": "Relic-Bot Security for RelicCraft verification, moderation, automod, levels and security tools.",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {

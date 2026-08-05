@@ -20,6 +20,12 @@ const dns = require("node:dns").promises;
 const net = require("node:net");
 const path = require("node:path");
 
+function readPort(value, fallback = null) {
+  if (!value) return fallback;
+  const port = Number(value);
+  return Number.isFinite(port) && port > 0 ? port : fallback;
+}
+
 const CONFIG = {
   token: process.env.DISCORD_TOKEN,
   clientId: process.env.CLIENT_ID,
@@ -33,6 +39,18 @@ const CONFIG = {
   appealUrl: process.env.APPEAL_URL || "https://discord.gg/CYJ4bfTYMN",
   minecraftHost: process.env.MC_SERVER_HOST,
   minecraftPort: process.env.MC_SERVER_PORT ? Number(process.env.MC_SERVER_PORT) : null,
+  minecraftServers: [
+    {
+      name: process.env.MC_SERVER_1_NAME || "Relic-Server #1",
+      host: process.env.MC_SERVER_1_HOST || process.env.MC_SERVER_HOST || "play.reliccraft.online",
+      port: readPort(process.env.MC_SERVER_1_PORT || process.env.MC_SERVER_PORT, 31688),
+    },
+    {
+      name: process.env.MC_SERVER_2_NAME || "Relic-Server #2",
+      host: process.env.MC_SERVER_2_HOST || "reliccraftsafe.minerent.io",
+      port: readPort(process.env.MC_SERVER_2_PORT, 25565),
+    },
+  ].filter((server) => server.host),
   minecraftStatusChannelId: process.env.MC_STATUS_CHANNEL_ID,
   minecraftStatusIntervalMs: Number(process.env.MC_STATUS_INTERVAL_MS || 35_000),
   antiSpamEnabled: process.env.ANTI_SPAM_ENABLED !== "false",
@@ -405,17 +423,19 @@ function parseMinecraftResponse(buffer) {
   return JSON.parse(buffer.subarray(offset, offset + jsonLength.value).toString("utf8"));
 }
 
-async function resolveMinecraftTarget() {
-  if (!CONFIG.minecraftHost) return null;
+async function resolveMinecraftTarget(server = null) {
+  const host = server?.host || CONFIG.minecraftHost;
+  const port = server?.port || CONFIG.minecraftPort || 25565;
+  if (!host) return null;
 
   try {
-    const records = await dns.resolveSrv(`_minecraft._tcp.${CONFIG.minecraftHost}`);
+    const records = await dns.resolveSrv(`_minecraft._tcp.${host}`);
     if (records.length > 0) {
       const record = records.sort((a, b) => a.priority - b.priority || b.weight - a.weight)[0];
       return {
         connectHost: record.name,
         connectPort: record.port,
-        displayHost: CONFIG.minecraftHost,
+        displayHost: host,
         displayPort: record.port,
       };
     }
@@ -424,15 +444,15 @@ async function resolveMinecraftTarget() {
   }
 
   return {
-    connectHost: CONFIG.minecraftHost,
-    connectPort: CONFIG.minecraftPort || 25565,
-    displayHost: CONFIG.minecraftHost,
-    displayPort: CONFIG.minecraftPort || 25565,
+    connectHost: host,
+    connectPort: port,
+    displayHost: host,
+    displayPort: port,
   };
 }
 
-async function pingMinecraftServer() {
-  const target = await resolveMinecraftTarget();
+async function pingMinecraftServer(server = null) {
+  const target = await resolveMinecraftTarget(server);
 
   return new Promise((resolve) => {
     if (!target) {
@@ -460,6 +480,7 @@ async function pingMinecraftServer() {
         const response = parseMinecraftResponse(Buffer.concat(chunks));
         finish({
           online: true,
+          name: server?.name || "RelicCraft",
           onlinePlayers: response.players?.online || 0,
           maxPlayers: response.players?.max || 0,
           players: response.players?.sample?.map((player) => player.name) || [],
@@ -496,6 +517,43 @@ function saveStatusMessageId(messageId) {
 }
 
 function createMinecraftStatusEmbed(status) {
+  if (status?.servers) {
+    const onlineServers = status.servers.filter((server) => server.online);
+    const color = onlineServers.length > 0 ? 0x57f287 : 0xed4245;
+    const serverLines = status.servers.map((server) => {
+      if (!server.online) {
+        const fallbackAddress = `${server.config.host}:${server.config.port || 25565}`;
+        return `**${server.config.name}**\nОффлайн или не отвечает на ping.\nАдрес: \`${server.displayAddress || fallbackAddress}\``;
+      }
+
+      const playersText = server.players.length > 0
+        ? server.players.map((name) => `• ${name}`).join("\n")
+        : EMPTY_PLAYER_MESSAGES[Math.floor(Math.random() * EMPTY_PLAYER_MESSAGES.length)];
+
+      return [
+        `**${server.config.name}**`,
+        `Онлайн: **${server.onlinePlayers}/${server.maxPlayers}**`,
+        `Адрес: \`${server.displayAddress}\``,
+        `Версия: ${server.version}`,
+        `Кто играет:\n${playersText}`,
+      ].join("\n");
+    });
+
+    return new EmbedBuilder()
+      .setColor(color)
+      .setTitle("RelicCraft | Онлайн серверов")
+      .setDescription(`Сейчас на серверах **${status.totalOnline}/${status.totalMax}** игроков.`)
+      .addFields(
+        { name: "Общий онлайн", value: `Сервера- **${status.totalOnline}/${status.totalMax}** Онлайн` },
+        ...serverLines.map((line, index) => ({
+          name: CONFIG.minecraftServers[index]?.name || `Сервер #${index + 1}`,
+          value: line.slice(0, 1024),
+        })),
+      )
+      .setFooter({ text: "Сообщение обновляется автоматически" })
+      .setTimestamp();
+  }
+
   const fallbackAddress = `${CONFIG.minecraftHost}:${CONFIG.minecraftPort || 25565}`;
 
   if (!status || !status.online) {
@@ -526,6 +584,46 @@ function createMinecraftStatusEmbed(status) {
 }
 
 async function updateMinecraftStatus() {
+  if (CONFIG.minecraftServers.length > 0) {
+    const servers = await Promise.all(
+      CONFIG.minecraftServers.map(async (server) => {
+        const result = await pingMinecraftServer(server);
+        return {
+          ...result,
+          config: server,
+          displayAddress: result?.displayAddress || `${server.host}:${server.port || 25565}`,
+        };
+      }),
+    );
+    const totalOnline = servers.reduce((sum, server) => sum + (server?.online ? server.onlinePlayers || 0 : 0), 0);
+    const totalMax = servers.reduce((sum, server) => sum + (server?.online ? server.maxPlayers || 0 : 0), 0);
+    const summary = { servers, totalOnline, totalMax };
+
+    if (totalMax > 0) {
+      client.user.setActivity(`Сервера- ${totalOnline}/${totalMax} Онлайн`, { type: ActivityType.Watching });
+    } else {
+      client.user.setActivity("Сервера оффлайн", { type: ActivityType.Watching });
+    }
+
+    if (!CONFIG.minecraftStatusChannelId) return;
+
+    const channel = await client.channels.fetch(CONFIG.minecraftStatusChannelId).catch(() => null);
+    if (!channel?.isTextBased()) return;
+
+    const embed = createMinecraftStatusEmbed(summary);
+    const messageId = loadStatusMessageId();
+    const oldMessage = messageId ? await channel.messages.fetch(messageId).catch(() => null) : null;
+
+    if (oldMessage) {
+      await oldMessage.edit({ embeds: [embed] });
+      return;
+    }
+
+    const message = await channel.send({ embeds: [embed] });
+    saveStatusMessageId(message.id);
+    return;
+  }
+
   if (!CONFIG.minecraftHost) return;
 
   const status = await pingMinecraftServer();
